@@ -320,6 +320,32 @@ pub(crate) fn live_span_bytes() -> u64 {
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
 }
 
+/// For the memory census (`crate::census`), each counted once by the copy
+/// that owns it: host copies of title memory alive and the bytes of title
+/// memory they copy; the card sides of buffers' copies and their "before"
+/// twins; windows' card sides; windows in card memory the CPU maps; and the
+/// bytes snapshot buffers kept for reuse reserve (`u64::MAX` while their
+/// pool is busy).
+pub(crate) fn census_bytes() -> [u64; 7] {
+    let snapshots = POOL.try_lock().map_or(u64::MAX, |pool| pool.iter().map(|v| v.capacity() as u64).sum());
+    [
+        LIVE[0].load(Ordering::Relaxed),
+        LIVE[1].load(Ordering::Relaxed),
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_BYTES[1].load(Ordering::Relaxed),
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+        WINDOW_MAPPED_BYTES.load(Ordering::Relaxed),
+        snapshots,
+    ]
+}
+
+impl Shadow {
+    /// The bytes of title memory this copies.
+    pub(crate) fn title_len(&self) -> u64 {
+        self.len
+    }
+}
+
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
 pub(crate) fn card_stats() -> [u64; 10] {
@@ -1259,6 +1285,18 @@ mod relay_tests {
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// The bytes of snapshot buffers kept beyond the largest one: 512 MiB, or
+/// `VICTORY_SNAPSHOT_POOL_MB`.
+fn snapshot_bytes_kept() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(512 << 20, |mb| mb.saturating_mul(1 << 20))
+    })
+}
+
 pub(crate) fn trim_snapshots() {
     let freed = std::mem::take(&mut *POOL.lock().unwrap_or_else(|e| e.into_inner()));
     drop(freed);
@@ -1303,14 +1341,14 @@ fn snapshots_kept() -> usize {
 /// the largest, and of those the largest one and the next ones up to `KEPT`
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept_most = snapshot_bytes_kept();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > kept_most {
             break;
         }
         kept += 1;
@@ -2120,7 +2158,11 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
-    if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
+    if at.is_multiple_of(4)
+        && title.len().is_multiple_of(4)
+        && title.len() == held.len()
+        && std::arch::is_x86_feature_detected!("avx2")
+    {
         // SAFETY: the processor has AVX2, and the lengths are the same.
         return unsafe { word_runs_avx2(title, held) };
     }
@@ -4727,7 +4769,7 @@ mod land_tests {
             });
             let mut now = vec![0u8; LEN];
             for round in 1..200u32 {
-                for block in (0..BLOCKS).filter(|b| (*b as u32 * 5 + round) % 3 != 0) {
+                for block in (0..BLOCKS).filter(|b| !(*b as u32 * 5 + round).is_multiple_of(3)) {
                     for i in (block * PIECE / 4 + 3..(block + 1) * PIECE / 4).step_by(4) {
                         now[i * 4..i * 4 + 4].copy_from_slice(&(round << 20 | i as u32).to_le_bytes());
                     }
@@ -5393,14 +5435,33 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
+    let size = view_copy_size(len);
+    let budget = view_copy_budget();
+    let mut bytes: u64 = map.values().map(|(shadow, _)| view_copy_size(shadow.len)).sum();
+    if map.len() >= MANY || bytes + size > budget {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
         map.retain(|_, (shadow, used)| {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
+        bytes = map.values().map(|(shadow, _)| view_copy_size(shadow.len)).sum();
+        if bytes + size > budget {
+            // Still over the bytes kept: the idle ones asked for longest
+            // ago go too, however lately. One a list or a slot holds stays
+            // (letting go of the key would not free it).
+            let entries = map
+                .iter()
+                .map(|(&key, (shadow, used))| {
+                    let idle = Arc::strong_count(shadow) == 1 && crate::host::references(&shadow.buffer) <= 1;
+                    (*used, key, view_copy_size(shadow.len), idle)
+                })
+                .collect();
+            for key in view_copy_evictions(entries, bytes, size, budget) {
+                map.remove(&key);
+            }
+        }
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let (buffer, data) = host()?.shared_buffer(size)?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5413,6 +5474,71 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Copies of single views' bytes made since the start.
 pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// The bytes of the buffer a view's copy of `len` bytes takes.
+fn view_copy_size(len: u64) -> u64 {
+    len.next_multiple_of(256)
+}
+
+/// The most bytes of copies of single views kept by [`exact`] once nothing
+/// else holds them: 64 MiB, or `VICTORY_VIEW_COPIES_MB`. Before, only their
+/// number was limited (256), and 256 copies of up to 64 MiB each could keep
+/// gigabytes of the PC's memory shared with the card.
+fn view_copy_budget() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_VIEW_COPIES_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(64 << 20, |mb| mb.saturating_mul(1 << 20))
+    })
+}
+
+/// Which of `entries` (last asked for, key, bytes, whether nothing else
+/// holds it) to let go of so that `need` more bytes fit under `budget`
+/// beside the `bytes` kept: idle ones only, those asked for longest ago
+/// first. Fewer than enough if the others are held.
+fn view_copy_evictions(
+    mut entries: Vec<(u64, (u64, u64), u64, bool)>,
+    mut bytes: u64,
+    need: u64,
+    budget: u64,
+) -> Vec<(u64, u64)> {
+    entries.retain(|e| e.3);
+    entries.sort_unstable_by_key(|e| e.0);
+    let mut out = Vec::new();
+    for (_, key, size, _) in entries {
+        if bytes + need <= budget {
+            break;
+        }
+        bytes = bytes.saturating_sub(size);
+        out.push(key);
+    }
+    out
+}
+
+/// For the census: the bytes of copies of single views [`exact`] keeps
+/// (`u64::MAX` while busy).
+pub(crate) fn view_copy_bytes() -> u64 {
+    EXACT.try_lock().map_or(u64::MAX, |guard| guard.1.values().map(|(shadow, _)| view_copy_size(shadow.len)).sum())
+}
+
+/// Lets go of every copy of a single view that nothing but [`exact`] holds
+/// (when idle memory is trimmed, `VICTORY_RAM_TRIM_MB`).
+pub(crate) fn trim_view_copies() {
+    let gone: Vec<Arc<Shadow>> = {
+        let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let map = &mut guard.1;
+        let idle: Vec<(u64, u64)> = map
+            .iter()
+            .filter(|(_, (shadow, _))| Arc::strong_count(shadow) == 1 && crate::host::references(&shadow.buffer) <= 1)
+            .map(|(&key, _)| key)
+            .collect();
+        idle.into_iter().filter_map(|key| map.remove(&key).map(|(shadow, _)| shadow)).collect()
+    };
+    // (Released without the lock.)
+    drop(gone);
+}
 
 /// With the frame line: the buffer views that got a copy of their own
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
@@ -5429,6 +5555,31 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+#[cfg(test)]
+mod view_copy_tests {
+    use super::view_copy_evictions;
+
+    #[test]
+    fn view_copies_go_oldest_first_and_only_when_idle() {
+        const MIB: u64 = 1 << 20;
+        // (last asked, key, bytes, idle)
+        let entries = vec![
+            (5, (0x500, 1), 16 * MIB, true),
+            (1, (0x100, 1), 16 * MIB, false),
+            (2, (0x200, 1), 16 * MIB, true),
+            (9, (0x900, 1), 16 * MIB, true),
+        ];
+        // 64 MiB kept of 64: a new one of 20 MiB needs two idle ones gone.
+        let gone = view_copy_evictions(entries.clone(), 64 * MIB, 20 * MIB, 64 * MIB);
+        assert_eq!(gone, vec![(0x200, 1), (0x500, 1)]);
+        // Enough room already: none.
+        assert!(view_copy_evictions(entries.clone(), 32 * MIB, 20 * MIB, 64 * MIB).is_empty());
+        // Never one that is held, even if that leaves the budget exceeded.
+        let gone = view_copy_evictions(entries, 64 * MIB, 64 * MIB, 64 * MIB);
+        assert_eq!(gone, vec![(0x200, 1), (0x500, 1), (0x900, 1)]);
+    }
 }
 
 #[cfg(test)]

@@ -101,7 +101,7 @@ pub(crate) struct ResourceDesc {
 #[cfg(windows)]
 impl ResourceDesc {
     /// The texture of this one's levels from `base` on.
-    fn from_level(&self, base: u32) -> ResourceDesc {
+    fn levels_from(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
         if base > 0 {
             d.width = (d.width >> base).max(1);
@@ -1182,6 +1182,54 @@ pub(crate) struct HostTexture {
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
+    /// Opt-in guest-range and host-lifetime record for target/depth textures.
+    audit: Option<TargetAudit>,
+    /// A reused placed target range must be activated and initialized in
+    /// the first-use command prelude.
+    alias_pending: std::sync::atomic::AtomicBool,
+    target_pooled: bool,
+    target_reused: bool,
+}
+
+#[cfg(windows)]
+struct TargetAudit {
+    serial: u64,
+    resource: usize,
+    guest_start: u64,
+    guest_bytes: u64,
+    host_bytes: u64,
+    format: u32,
+    width: u64,
+    height: u32,
+    layers: u16,
+    mips: u16,
+    flags: u32,
+    created_frame: u64,
+    pooled: bool,
+    reused: bool,
+}
+
+#[cfg(windows)]
+impl TargetAudit {
+    fn event(&self, event: &'static str) {
+        tracing::info!(
+            target: "victory_gpu::target_audit",
+            event, serial = self.serial, resource = self.resource,
+            guest_start = self.guest_start, guest_bytes = self.guest_bytes,
+            host_bytes = self.host_bytes, format = self.format,
+            width = self.width, height = self.height, layers = self.layers,
+            mips = self.mips, flags = self.flags,
+            pooled = self.pooled, reused = self.reused,
+            created_frame = self.created_frame, frame = crate::frame::current(),
+            "render target lifetime"
+        );
+    }
+}
+
+#[cfg(windows)]
+fn target_audit_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_AUDIT").is_some_and(|v| v == "1"))
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -1249,6 +1297,7 @@ pub(crate) fn held_only() -> bool {
 pub(crate) fn first_mip(view: &[u32]) -> u32 {
     const TEXTURE_2D_VIEW: u32 = 4;
     match *view {
+        [_, TEXTURE_2D_VIEW, _, _, first, ..] if first == u32::MAX => u32::MAX,
         [_, TEXTURE_2D_VIEW, _, _, first, ..] => first.min(15),
         _ => 0,
     }
@@ -1557,7 +1606,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
-            let capped = crate::texture::max_dim().is_some_and(|cap| {
+            let capped = crate::texture::drop_mips() != 0 || crate::texture::max_dim().is_some_and(|cap| {
                 r.desc.width.max(u64::from(r.desc.height)) > u64::from(cap)
             });
             let partly = readable
@@ -1584,14 +1633,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
-            let first = wanted.min(viewed);
+            let first = wanted.min(viewed).max(crate::texture::drop_mips());
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
             }
         }
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc.from_level(base), r.host.state, clear),
+            None => host_texture(&r.desc.levels_from(base), r.host.state, clear),
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -1620,6 +1669,26 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             HELD[0].fetch_add(1, Relaxed);
             HELD[1].fetch_add(host.bytes, Relaxed);
             HELD[3].fetch_add(footprint(&r.desc).map_or(0, |f| f.size), Relaxed);
+        }
+        if target_audit_on() && r.desc.flags & 3 != 0 {
+            let audit = TargetAudit {
+                serial: host.serial,
+                resource: this as usize,
+                guest_start: r.data() as u64,
+                guest_bytes: footprint(&r.desc).map_or(0, |f| f.size),
+                host_bytes: host.bytes,
+                format: r.desc.format,
+                width: r.desc.width,
+                height: r.desc.height,
+                layers: r.desc.depth_or_array_size,
+                mips: r.desc.mip_levels,
+                flags: r.desc.flags,
+                created_frame: crate::frame::current(),
+                pooled: host.target_pooled,
+                reused: host.target_reused,
+            };
+            audit.event("host_create");
+            host.audit = Some(audit);
         }
         host.filled = fills(&r.desc);
         if host.filled {
@@ -1679,7 +1748,6 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
@@ -1692,20 +1760,15 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         return filled < limit;
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
-    if filled < floor {
-        return true;
-    }
-    match memory {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
-        }
-        None => filled < WITHOUT_BUDGET,
-    }
+    crate::budget::admit_textures(
+        memory,
+        filled,
+        floor,
+        crate::pool::texture_room(),
+        crate::shadow::card_room_kept(),
+        targets_room_kept(),
+        room_percent(),
+    )
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -1737,7 +1800,7 @@ pub(crate) fn targets_room_kept() -> u64 {
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    most.saturating_sub(targets).saturating_sub(crate::pool::target_room())
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2285,11 +2348,16 @@ impl HostTexture {
         self.flags
     }
 
-    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+    pub(crate) fn take_alias_pending(&self) -> bool {
+        self.alias_pending.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub(crate) fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         // SAFETY: a live texture.
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
+        let target_status = crate::pool::take_target_status(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
@@ -2304,6 +2372,10 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            audit: None,
+            alias_pending: std::sync::atomic::AtomicBool::new(target_status.is_some()),
+            target_pooled: target_status.is_some(),
+            target_reused: target_status.unwrap_or(false),
         }
     }
 
@@ -2329,6 +2401,10 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            audit: None,
+            alias_pending: Default::default(),
+            target_pooled: false,
+            target_reused: false,
         }
     }
 }
@@ -2342,6 +2418,9 @@ impl Drop for HostTexture {
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
+        }
+        if let Some(audit) = &self.audit {
+            audit.event("host_destroy");
         }
     }
 }
@@ -2483,6 +2562,29 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    // Single-sample color RTs and depth-only targets can share a bounded
+    // RT/DS heap block. UAV resources keep their separate twin/copy path.
+    const TEXTURE_2D: u32 = 3;
+    let target_kind = d.flags & (TARGET | DEPTH);
+    if !reserved
+        && d.dimension == TEXTURE_2D
+        && d.sample_count == 1
+        && target_kind.count_ones() == 1
+        && d.flags & UNORDERED == 0
+        && let Some(t) = unsafe {
+            crate::pool::target(
+                &host.device,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
+                clear_value.as_ref().map(|value| std::ptr::from_ref(value).cast::<D3D12_CLEAR_VALUE>()),
+            )
+        }
+    {
+        crate::host::name(&t, || {
+            format!("render target {}x{} f{} in a block", d.width, d.height, d.format)
+        });
+        return Some(t);
+    }
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
@@ -2538,7 +2640,7 @@ fn host_texture_as(
         }
     };
     if let Err(e) = &made {
-        crate::residency::allocation_error(&e);
+        crate::residency::allocation_error(e);
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
     if !reserved
@@ -2959,6 +3061,7 @@ static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// See [`PLACED_TWINS`].
 #[cfg(windows)]
+#[allow(dead_code)] // Read by the optional memory census/report path.
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -3306,6 +3409,13 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn first_mip_preserves_unspecified_sentinel_and_caps_real_levels() {
+        assert_eq!(first_mip(&[0, 4, 0, 0, u32::MAX]), u32::MAX);
+        assert_eq!(first_mip(&[0, 4, 0, 0, 18]), 15);
+        assert_eq!(first_mip(&[0, 4, 0, 0, 3]), 3);
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

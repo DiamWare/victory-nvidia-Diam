@@ -160,8 +160,13 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     let index = match found {
         Some(index) => index,
         None => {
+            let heap_bytes = u64::from(HEAP_TILES) * TILE;
+            if !crate::budget::admit_pool_growth(host().and_then(|h| h.video_memory()), heap_bytes) {
+                tracing::debug!(heap_bytes, "tile heap growth refused by shared GPU memory budget");
+                return None;
+            }
             let desc = D3D12_HEAP_DESC {
-                SizeInBytes: u64::from(HEAP_TILES) * TILE,
+                SizeInBytes: heap_bytes,
                 Properties: D3D12_HEAP_PROPERTIES {
                     Type: D3D12_HEAP_TYPE_DEFAULT,
                     ..Default::default()

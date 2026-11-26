@@ -32,6 +32,28 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
+/// The name this fork shows in the running title's caption and the overlay.
+pub(crate) const FORK_LABEL: &str = "adel";
+/// The upstream name this fork replaces in the title's own caption.
+const UPSTREAM_LABEL: &str = "soldsawn";
+
+/// The title's own window caption is where the runner shows which fork is
+/// running the game. Replace the upstream name with ours, whatever case it
+/// used, without touching the rest of the title's text.
+fn rebrand_caption(caption: &str) -> String {
+    let lower = caption.to_ascii_lowercase();
+    let mut out = String::with_capacity(caption.len());
+    let mut at = 0;
+    while let Some(rel) = lower[at..].find(UPSTREAM_LABEL) {
+        let start = at + rel;
+        out.push_str(&caption[at..start]);
+        out.push_str(FORK_LABEL);
+        at = start + UPSTREAM_LABEL.len();
+    }
+    out.push_str(&caption[at..]);
+    out
+}
+
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
@@ -445,7 +467,13 @@ fn sweep() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    let cadence = if crate::residency::trim_idle() { 500 } else { 1_000 };
+    let cadence = if crate::residency::critical() {
+        250
+    } else if crate::residency::pressured() || crate::residency::trim_idle() {
+        500
+    } else {
+        1_000
+    };
     if now < last + cadence
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
@@ -462,9 +490,15 @@ fn sweep() {
     if crate::residency::trim_idle() {
         crate::list::trim_idle();
         crate::shadow::trim_snapshots();
+        crate::shadow::trim_view_copies();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
-    crate::pipeline::trim_library();
+    // Unlocking the pipeline library under pressure forces multi-hundred-ms
+    // remaps on the next load and has coincided with NVIDIA TDR; leave it
+    // mapped until headroom returns.
+    if !crate::residency::pressured() {
+        crate::pipeline::trim_library();
+    }
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
@@ -1040,6 +1074,98 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_caption_uses_our_fork_name() {
+        assert_eq!(super::rebrand_caption("soldsawn 8GB"), "adel 8GB");
+        assert_eq!(super::rebrand_caption("Soldsawn 8GB"), "adel 8GB");
+        assert_eq!(super::rebrand_caption("SOLDSAWN 8GB"), "adel 8GB");
+        assert_eq!(super::rebrand_caption("another fork"), "another fork");
+        assert_eq!(super::rebrand_caption(""), "");
+    }
+
+    #[test]
+    fn pooled_target_first_use_prelude_records_activation_and_initialization() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        let Some(host) = super::host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        };
+        let state = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_RENDER_TARGET.0);
+        // SAFETY: a valid single-sample 2D render-target description.
+        let Some(texture) = (unsafe { crate::pool::target(&host.device, &desc, state, None) }) else {
+            return;
+        };
+        let copy = std::sync::Arc::new(crate::resource::HostTexture::new(texture, state.0 as u32));
+        let list = host.new_list().expect("a host list can be created");
+        list.states.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            std::sync::Arc::as_ptr(&copy) as usize,
+            (state.0 as u32, state.0 as u32, copy),
+        );
+        assert!(list.prelude().is_some());
+        assert!(list.prelude().is_none());
+    }
+
+    #[test]
+    fn pooled_depth_target_first_use_activates_in_depth_write_state() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D32_FLOAT, DXGI_SAMPLE_DESC};
+
+        let Some(host) = super::host() else { return };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_D32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        };
+        let state = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_DEPTH_WRITE.0);
+        // SAFETY: a valid single-sample 2D depth-stencil description.
+        let Some(texture) = (unsafe { crate::pool::target(&host.device, &desc, state, None) }) else {
+            return;
+        };
+        let copy = std::sync::Arc::new(crate::resource::HostTexture::new(texture, state.0 as u32));
+        let list = host.new_list().expect("a host list can be created");
+        list.states.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            std::sync::Arc::as_ptr(&copy) as usize,
+            (state.0 as u32, state.0 as u32, copy),
+        );
+        assert!(list.prelude().is_some());
+        assert!(list.prelude().is_none());
+    }
+
+    #[test]
+    fn memory_benchmark_csv_distinguishes_process_and_adapter_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.csv");
+        // SAFETY: this test is the only caller in its test process and runs
+        // before the benchmark path's OnceLock has been initialized.
+        unsafe { std::env::set_var("VICTORY_MEMORY_BENCH_CSV", &path) };
+        super::memory_benchmark_line(20.0, 50.0);
+        let text = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].split(',').count(), 16);
+        assert_eq!(lines[1].split(',').count(), 16);
+        assert_eq!(lines[1].split(',').nth(3), Some("20.000"));
+        assert_eq!(lines[1].split(',').nth(4), Some("50.000"));
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -1232,6 +1358,15 @@ pub(crate) struct HostList {
 
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// Put DRED-visible labels directly on the prelude command list. These are
+/// intentionally emitted only by diagnostics builds.
+#[cfg(feature = "diagnostics")]
+fn prelude_breadcrumb(list: &ID3D12GraphicsCommandList, label: &str) {
+    let text: Vec<u16> = label.encode_utf16().chain([0]).collect();
+    // SAFETY: the list is open and copies the marker text during the call.
+    unsafe { list.SetMarker(0, Some(text.as_ptr().cast()), (text.len() * 2) as u32) };
+}
 
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
@@ -1872,6 +2007,17 @@ const SPARE_MOST: u64 = 128 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
 
+/// A lower limit for either of those: `VICTORY_SCRATCH_SPARE_MB`.
+fn scratch_spare_cap() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_SCRATCH_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(u64::MAX, |mb| mb.saturating_mul(1 << 20))
+    })
+}
+
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
 /// is reset or dropped, for the next list. Before, a list kept every chunk
@@ -1955,7 +2101,8 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
                     SPARE_KEPT
                 } else {
                     SPARE_MOST
-                };
+                }
+                .min(scratch_spare_cap());
                 spare.give(chunk, size, limit)
             } else {
                 Some(chunk)
@@ -2623,11 +2770,27 @@ mod relay_tests {
 /// descriptor slots, upload
 /// memory and scratch chunks are held until then, and a frame's lists held
 /// all at once ran the slots out before (run 45).
+///
+/// Under host-memory pressure the cap drops (64, or 32 when critical) so
+/// submit prep cannot pile up multi-second waits that trip NVIDIA TDR.
+/// On ≤32 GiB hosts the default base is 96 instead of 256.
 fn late_most() -> usize {
-    static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    static BASE: OnceLock<usize> = OnceLock::new();
+    let base = *BASE.get_or_init(|| {
+        let default = if crate::residency::limited_host_ram() { 96 } else { 256 };
+        std::env::var("VICTORY_LATE_WAIT_LISTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
+            .max(1)
+    });
+    if crate::residency::critical() {
+        base.min(32)
+    } else if crate::residency::pressured() {
+        base.min(64)
+    } else {
+        base
+    }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -2675,6 +2838,8 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+// Keep the hot submission payload inline; each element is one flight.
+#[allow(clippy::large_enum_variant)]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -2901,7 +3066,7 @@ fn blame_stale(stale: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) 
 /// title memory read, took `us`.
 #[cfg(feature = "diagnostics")]
 fn blamed(why: usize, us: u64) {
-    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (named, refused) = std::mem::take(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()));
     let (key, at) = match (why, named) {
         (WHY_READ | WHY_STALE, Some(named)) => named,
         (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
@@ -3700,6 +3865,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+#[cfg(feature = "diagnostics")]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -5557,15 +5723,36 @@ impl Host {
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() {
             // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
-            if upcheck::on() {
-                upcheck::at_rest(self);
+            // with nothing in the air: one is made for the sweep. Under
+            // critical host RAM a full settle+reclaim here has blocked
+            // submit prep for >10 s and tripped NVIDIA TDR; refresh
+            // admission and trim pool spares only, and space full sweeps
+            // further apart while merely pressured.
+            let interval = if crate::residency::critical() {
+                4_000
+            } else if crate::residency::pressured() {
+                2_500
+            } else {
+                1_500
+            };
+            if now_ms() > SWEPT.load(Ordering::Relaxed) + interval {
+                if crate::residency::critical() {
+                    crate::residency::refresh();
+                    crate::pool::room(host().and_then(|h| h.video_memory()));
+                    if crate::residency::pressured() || crate::residency::trim_idle() {
+                        trim_spare_chunks();
+                    }
+                } else {
+                    self.settle(&mut submitted, WHY_SYNC);
+                    if upcheck::on() {
+                        upcheck::at_rest(self);
+                    }
+                    sweep();
+                }
+                SWEPT.store(now_ms(), Ordering::Relaxed);
             }
-            sweep();
-            SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
@@ -6679,6 +6866,10 @@ impl HostList {
         // starts with (back to its real state if the list does not use it).
         let mut to_copy = Vec::new();
         let mut barriers = Vec::new();
+        let mut alias_barriers = Vec::new();
+        let mut alias_to_target = Vec::new();
+        let mut alias_discards = Vec::new();
+        let mut alias_from_target = Vec::new();
         let mut copying = std::collections::HashMap::new();
         for (depth, twin, colour) in &syncs {
             let (from, to) = if *colour {
@@ -6706,13 +6897,44 @@ impl HostList {
                 }
             }
         }
-        barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
+        for (key, (first, last, copy)) in states.iter() {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
-            (real != *first)
-                .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
-        }));
-        if barriers.is_empty() && syncs.is_empty() {
+            if copy.take_alias_pending() {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_RESOURCE_ALIASING_BARRIER, D3D12_RESOURCE_BARRIER,
+                    D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    D3D12_RESOURCE_BARRIER_TYPE_ALIASING, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                };
+                const DEPTH_STENCIL: u32 = 2;
+                let target = if copy.flags() & DEPTH_STENCIL != 0 {
+                    D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_DEPTH_WRITE.0)
+                } else {
+                    D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_RENDER_TARGET.0)
+                };
+                alias_barriers.push(D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                            pResourceBefore: std::mem::ManuallyDrop::new(None),
+                            pResourceAfter: std::mem::ManuallyDrop::new(Some(copy.texture.clone())),
+                        }),
+                    },
+                });
+                if real != target.0 as u32 {
+                    alias_to_target.push(transition(&copy.texture, host_state(real), target));
+                }
+                alias_discards.push(copy.texture.clone());
+                if target.0 as u32 != *first {
+                    alias_from_target.push(transition(&copy.texture, target, host_state(*first)));
+                }
+            } else if real != *first {
+                barriers.push(transition(&copy.texture, host_state(real), host_state(*first)));
+            }
+        }
+        if barriers.is_empty() && syncs.is_empty() && alias_barriers.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6727,6 +6949,38 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                if !alias_barriers.is_empty() {
+                    #[cfg(feature = "diagnostics")]
+                    prelude_breadcrumb(
+                        list,
+                        &format!("alias prelude: activate reused ranges ({})", alias_barriers.len()),
+                    );
+                    list.ResourceBarrier(&alias_barriers);
+                }
+                if !alias_to_target.is_empty() {
+                    #[cfg(feature = "diagnostics")]
+                    prelude_breadcrumb(
+                        list,
+                        &format!("alias prelude: enter RT/DS use ({})", alias_to_target.len()),
+                    );
+                    list.ResourceBarrier(&alias_to_target);
+                }
+                for texture in &alias_discards {
+                    #[cfg(feature = "diagnostics")]
+                    prelude_breadcrumb(
+                        list,
+                        &format!("alias prelude: discard target {:#x}", texture.as_raw() as usize),
+                    );
+                    list.DiscardResource(texture, None);
+                }
+                if !alias_from_target.is_empty() {
+                    #[cfg(feature = "diagnostics")]
+                    prelude_breadcrumb(
+                        list,
+                        &format!("alias prelude: restore first-use state ({})", alias_from_target.len()),
+                    );
+                    list.ResourceBarrier(&alias_from_target);
+                }
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -7772,6 +8026,7 @@ enum Touch {
     /// The copy is given to shaders.
     Write(usize),
     /// Title memory is written.
+    #[allow(dead_code)] // Explicit boundary marker retained for written-span callers.
     Title,
     Nothing,
     /// Another part of the submission begins.
@@ -8728,6 +8983,7 @@ impl Meter {
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
+        memory_benchmark_line(fps, ms);
         let draws = (drawn - self.drawn) as f64 / frames;
         crate::overlay::set_frame(fps, ms, draws);
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
@@ -8735,6 +8991,9 @@ impl Meter {
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
         });
+        // Always publish, even with telemetry and the overlay off: the ring
+        // is cheap and the recorder only reads it when a run has opted in.
+        victory_telemetry::metrics::publish(fps, ms, draws, cpu, gpu);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
@@ -8961,10 +9220,11 @@ impl Meter {
             // SAFETY: a window handle and a buffer of that length.
             let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
             buffer.truncate(n.max(0) as usize);
-            self.caption = Some(buffer);
+            let caption = String::from_utf16_lossy(&buffer);
+            self.caption = Some(rebrand_caption(&caption).encode_utf16().collect());
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = format!(" | {FORK_LABEL} VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -8989,6 +9249,64 @@ impl Meter {
                     }
                 });
         });
+    }
+}
+
+/// Optional once-per-second system/adapter memory row for reproducible
+/// comparisons. Private commit, working set, local GPU use and shared GPU
+/// use remain separate quantities.
+fn memory_benchmark_line(fps: f64, frame_ms: f64) {
+    use std::io::Write;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| {
+        std::env::var_os("VICTORY_MEMORY_BENCH_CSV").filter(|p| !p.is_empty()).map(Into::into)
+    }).as_ref() else { return };
+    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let Some(file) = FILE.get_or_init(|| {
+        let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(?path, %error, "memory benchmark CSV could not be opened");
+                return None;
+            }
+        };
+        if file.metadata().is_ok_and(|m| m.len() == 0) {
+            let _ = writeln!(file, "utc_ms,elapsed_ms,frame,fps,frame_ms,private_commit_bytes,working_set_bytes,local_budget_bytes,local_used_bytes,shared_budget_bytes,shared_used_bytes,queued_textures,due_textures,waiting_memory_textures,partial_textures,oldest_due_frames");
+        }
+        Some(Mutex::new(file))
+    }).as_ref() else { return };
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: correctly sized counters and this process' pseudo-handle.
+    let memory_ok = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
+            counters.cb,
+        ) != 0
+    };
+    let groups = host().and_then(|h| h.video_memory_groups());
+    let local = groups.map_or([0; 4], |g| g[0]);
+    let shared = groups.map_or([0; 4], |g| g[1]);
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let elapsed_ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis();
+    let utc_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_millis());
+    let queue = crate::draw::HEAP_TEXTURES_QUEUE.each_ref().map(|n| n.load(Ordering::Relaxed));
+    let (commit, working) = if memory_ok { (counters.PrivateUsage as u64, counters.WorkingSetSize as u64) } else { (0, 0) };
+    let row = format!(
+        "{utc_ms},{elapsed_ms},{},{fps:.3},{frame_ms:.3},{commit},{working},{},{},{},{},{},{},{},{},{}",
+        crate::frame::current(), local[0], local[1], shared[0], shared[1],
+        queue[0], queue[1], queue[2], queue[3], queue[4]
+    );
+    if let Err(error) = writeln!(*file.lock().unwrap_or_else(|e| e.into_inner()), "{row}") {
+        tracing::warn!(?path, %error, "memory benchmark CSV write failed");
     }
 }
 

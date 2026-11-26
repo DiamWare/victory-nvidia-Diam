@@ -92,11 +92,42 @@ pub fn note_title_output(line: &str) {
     if line.is_empty() {
         return;
     }
+    note_breakpad_artifact(line);
     let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
     if said.len() == SAID_LINES {
         said.pop_front();
     }
     said.push_back(line.to_owned());
+}
+
+/// Breakpad prints the minidump path before the blocked upload. Surface it so
+/// the dump is not mistaken for a network failure and can still be collected.
+fn note_breakpad_artifact(line: &str) {
+    let Some(path) = breakpad_attached_path(line) else {
+        return;
+    };
+    tracing::warn!(
+        path = %path.display(),
+        "title crash dump on disk (upload skipped; offline by design)"
+    );
+}
+
+fn breakpad_attached_path(line: &str) -> Option<std::path::PathBuf> {
+    let line = line.trim();
+    if !line.contains("Added file") {
+        return None;
+    }
+    let start = line.rfind('(')?;
+    let end = line.rfind(')')?;
+    if end <= start + 1 {
+        return None;
+    }
+    let path = line[start + 1..end].trim();
+    let lower = path.to_ascii_lowercase();
+    if !(lower.ends_with(".dmp") || lower.ends_with(".crash.log") || lower.ends_with(".log")) {
+        return None;
+    }
+    Some(std::path::PathBuf::from(path))
 }
 
 /// The kept lines, one per report line; nothing if another thread holds
@@ -797,6 +828,16 @@ mod tests {
         // SAFETY: a non-null entry belongs to `image`, which the lookup wrote,
         // and `BeginAddress` is an offset into that image.
         Some(image + u64::from(unsafe { (*entry).BeginAddress }))
+    }
+
+    #[test]
+    fn breakpad_dump_paths_are_parsed_from_title_output() {
+        let path = breakpad_attached_path(
+            "BacktraceBreakpad:http_upload.cc:505:Added file 'upload_file_minidump' (T:\\a.dmp)",
+        );
+        assert_eq!(path.as_deref(), Some(std::path::Path::new(r"T:\a.dmp")));
+        assert!(breakpad_attached_path("unrelated line").is_none());
+        assert!(breakpad_attached_path("Added file 'other' (C:\\x.txt)").is_none());
     }
 
     #[test]

@@ -14,11 +14,18 @@ victory-loader.workspace = true
 victory-hle.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
 victory-game.workspace = true
+victory-telemetry.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
+tracing.workspace = true
 walkdir.workspace = true
+
+[build-dependencies]
+sha2 = "0.10.9"
+ureq = "2.12.1"
+zip = { version = "2.2.3", default-features = false, features = ["deflate"] }
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,

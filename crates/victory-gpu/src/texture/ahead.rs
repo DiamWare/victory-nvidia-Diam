@@ -104,7 +104,16 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
-    let most = if crate::residency::limited_host_ram() { 32 << 20 } else { MOST };
+    // Speculative ahead uploads compete with submit prep for CPU and RAM;
+    // under critical pressure they amplify multi-second stalls / TDR risk.
+    if crate::residency::critical() {
+        return turned_down();
+    }
+    let most = if crate::residency::pressured() || crate::residency::limited_host_ram() {
+        16 << 20
+    } else {
+        MOST
+    };
     if !crate::residency::allow_staging_growth(false)
         || BYTES.load(Relaxed) >= most
         || copy.flags() & 0x7 != 0

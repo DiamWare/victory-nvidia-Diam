@@ -24,6 +24,9 @@ pub struct Config {
     pub test_titles: Vec<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
+    /// Anonymous performance reports are on unless the user opts out with
+    /// `VICTORY_TELEMETRY=0`, `[telemetry] enabled = false`, or `--no-telemetry`.
+    pub telemetry_enabled: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +34,14 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    telemetry: FileTelemetry,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileTelemetry {
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,11 +81,14 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed.paths, parsed.telemetry, source, |k| {
+            std::env::var_os(k)
+        })
     }
 
     fn resolve(
         file: FilePaths,
+        telemetry: FileTelemetry,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
@@ -91,12 +105,19 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        let telemetry_enabled = match env("VICTORY_TELEMETRY") {
+            Some(value) if !value.is_empty() => {
+                !matches!(value.to_str(), Some("0" | "false" | "False" | "FALSE"))
+            }
+            _ => telemetry.enabled.unwrap_or(true),
+        };
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
             test_titles,
             source,
+            telemetry_enabled,
         })
     }
 
@@ -157,7 +178,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, FileTelemetry::default(), None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
     }
@@ -169,7 +190,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, FileTelemetry::default(), None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
     }
 
@@ -180,7 +201,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, FileTelemetry::default(), None, env).unwrap();
         assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
     }
 
@@ -189,7 +210,7 @@ mod tests {
         let value = std::env::join_paths(["first", "second"]).unwrap();
         let file = FilePaths::default();
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, FileTelemetry::default(), None, env).unwrap();
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]
@@ -212,6 +233,40 @@ mod tests {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn telemetry_is_on_by_default_and_config_can_disable_it() {
+        let env = |_: &str| None;
+        let cfg =
+            Config::resolve(FilePaths::default(), FileTelemetry::default(), None, env).unwrap();
+        assert!(cfg.telemetry_enabled);
+        let cfg = Config::resolve(
+            FilePaths::default(),
+            FileTelemetry {
+                enabled: Some(false),
+            },
+            None,
+            env,
+        )
+        .unwrap();
+        assert!(!cfg.telemetry_enabled);
+    }
+
+    #[test]
+    fn telemetry_env_overrides_config() {
+        let file = FileTelemetry {
+            enabled: Some(false),
+        };
+        let env = |k: &str| (k == "VICTORY_TELEMETRY").then(|| OsString::from("1"));
+        let cfg = Config::resolve(FilePaths::default(), file, None, env).unwrap();
+        assert!(cfg.telemetry_enabled);
+        let file = FileTelemetry {
+            enabled: Some(true),
+        };
+        let env = |k: &str| (k == "VICTORY_TELEMETRY").then(|| OsString::from("0"));
+        let cfg = Config::resolve(FilePaths::default(), file, None, env).unwrap();
+        assert!(!cfg.telemetry_enabled);
     }
 
     #[test]

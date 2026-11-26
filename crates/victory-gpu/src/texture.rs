@@ -47,9 +47,12 @@ pub(crate) struct Staging {
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
+    /// Title mip/array-slice represented by each footprint.
+    parts: Vec<(u32, u32)>,
+    /// D3D12 indices corresponding to the footprints (not necessarily
+    /// contiguous when a mip prefix is omitted from an array).
+    subresources: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice, of the title's texture.
-    mips: u32,
     /// The first of them that is read and uploaded
     /// (`crate::resource::held_only`), the one the host copy begins at, and
     /// the bytes of title memory read.
@@ -519,6 +522,17 @@ pub(crate) fn max_dim() -> Option<u32> {
     })
 }
 
+/// Lowest-resolution mip retained by the opt-in texture-tail policy.
+/// It applies in committed mip trimming and tiled residency; zero disables it.
+pub(crate) fn drop_mips() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| parse_drop_mips(std::env::var("VICTORY_TEXTURE_DROP_MIPS").ok().as_deref()))
+}
+
+fn parse_drop_mips(value: Option<&str>) -> u32 {
+    value.and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(4)
+}
+
 fn capped_first_mip(width: u32, height: u32, levels: usize, cap: u32) -> usize {
     let largest = width.max(height);
     (0..levels.min(32))
@@ -537,6 +551,16 @@ fn texture_cap_keeps_the_coarsest_mip() {
     assert_eq!(capped_first_mip(4096, 4096, 0, 64), 0);
 }
 
+#[cfg(test)]
+#[test]
+fn texture_drop_mips_is_bounded_and_defaults_off() {
+    assert_eq!(parse_drop_mips(None), 0);
+    assert_eq!(parse_drop_mips(Some("2")), 2);
+    assert_eq!(parse_drop_mips(Some(" 4 ")), 4);
+    assert_eq!(parse_drop_mips(Some("99")), 4);
+    assert_eq!(parse_drop_mips(Some("invalid")), 0);
+}
+
 /// Lets go of the staging buffers no list recorded a use of for `IDLE_MS`
 /// and `IDLE_FRAMES` frames and no list holds: a staging buffer is system memory the size of its
 /// texture, kept so that an unchanged texture is not uploaded again, and
@@ -547,6 +571,12 @@ fn texture_cap_keeps_the_coarsest_mip() {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    // Staging is an upload cache, not authoritative texture storage. Under
+    // commit pressure, drop entries owned only by the cache now; the next
+    // sample will re-detile them. In-flight lists retain their Arc and GPU
+    // upload source until the existing list/fence path releases it.
+    let memory_pressure = crate::residency::pressured() || crate::residency::critical();
+    let cache_budget = staging_cache_budget(memory_pressure);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -560,8 +590,11 @@ pub(crate) fn let_go_idle() {
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+        let keep = keep_staging_cache_entry(
+            Arc::strong_count(s),
+            crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES),
+            memory_pressure,
+        );
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
@@ -570,8 +603,97 @@ pub(crate) fn let_go_idle() {
         }
         keep
     });
+    // Keep repeat-use uploads warm, but bound how much system RAM the cache
+    // can pin. Evict least-recently-used cache-only entries first; lists
+    // holding an Arc keep their upload source alive through execution.
+    let retained = map
+        .iter()
+        .filter(|(_, s)| Arc::strong_count(s) == 1)
+        .map(|(&key, s)| (key, s.used.load(Relaxed), s.bytes))
+        .collect::<Vec<_>>();
+    for key in staging_evictions(retained, cache_budget) {
+        if let Some(staging) = map.remove(&key) {
+            LET_GO[0].fetch_add(1, Relaxed);
+            LET_GO[1].fetch_add(staging.bytes, Relaxed);
+            went += 1;
+            bytes += staging.bytes;
+        }
+    }
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+    }
+}
+
+fn staging_cache_budget(memory_pressure: bool) -> u64 {
+    if memory_pressure {
+        return 0;
+    }
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    MB.get_or_init(|| parse_staging_cache_budget(std::env::var("VICTORY_STAGING_CACHE_MB").ok().as_deref()))
+    .to_owned()
+}
+
+fn parse_staging_cache_budget(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(8192)
+        << 20
+}
+
+fn staging_evictions(mut entries: Vec<(usize, u64, u64)>, budget: u64) -> Vec<usize> {
+    let mut total = entries
+        .iter()
+        .fold(0u64, |sum, (_, _, bytes)| sum.saturating_add(*bytes));
+    if total <= budget {
+        return Vec::new();
+    }
+    entries.sort_unstable_by_key(|(_, used, _)| *used);
+    let mut evict = Vec::new();
+    for (key, _, bytes) in entries {
+        if total <= budget {
+            break;
+        }
+        total = total.saturating_sub(bytes);
+        evict.push(key);
+    }
+    evict
+}
+
+#[cfg(test)]
+mod staging_budget_tests {
+    use super::{parse_staging_cache_budget, staging_evictions};
+
+    #[test]
+    fn cache_is_opt_in_and_budget_is_bounded() {
+        assert_eq!(parse_staging_cache_budget(None), 0);
+        assert_eq!(parse_staging_cache_budget(Some("256")), 256 << 20);
+        assert_eq!(parse_staging_cache_budget(Some("9000")), 8192 << 20);
+        assert_eq!(parse_staging_cache_budget(Some("bad")), 0);
+    }
+
+    #[test]
+    fn bounded_cache_evicts_oldest_until_under_budget() {
+        assert_eq!(staging_evictions(vec![(1, 10, 8), (2, 30, 8), (3, 20, 8)], 16), vec![1]);
+        assert_eq!(staging_evictions(vec![(1, 10, 8), (2, 30, 8)], 16), Vec::<usize>::new());
+        assert_eq!(staging_evictions(vec![(1, 10, 8), (2, 30, 8)], 0), vec![1, 2]);
+    }
+}
+
+fn keep_staging_cache_entry(owners: usize, idle: bool, memory_pressure: bool) -> bool {
+    owners > 1 || (!memory_pressure && !idle)
+}
+
+#[cfg(test)]
+mod staging_cache_tests {
+    use super::keep_staging_cache_entry;
+
+    #[test]
+    fn pressure_evicts_idle_cache_but_keeps_in_flight_uploads() {
+        assert!(!keep_staging_cache_entry(1, false, true));
+        assert!(keep_staging_cache_entry(2, false, true));
+        assert!(keep_staging_cache_entry(1, false, false));
+        assert!(!keep_staging_cache_entry(1, true, false));
     }
 }
 
@@ -763,7 +885,11 @@ pub(crate) struct Digest(u128);
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
-    let first = if crate::resource::held_only() { first } else { 0 };
+    let first = if crate::resource::held_only() || crate::tiles::wanted() {
+        first.max(drop_mips())
+    } else {
+        0
+    };
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -973,7 +1099,7 @@ fn record_upload(
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: staging.first - staging.level0 + i as u32,
+                SubresourceIndex: staging.subresources[i],
             },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
@@ -1185,7 +1311,9 @@ impl Staging {
     /// levels would be.
     fn judgement(&self) -> [u64; 2] {
         let start = self.memory as u64;
-        let first = crate::descriptor::host::first_viewed(start).map_or(0, u64::from);
+        let first = crate::descriptor::host::first_viewed(start)
+            .map_or(0, u64::from)
+            .max(u64::from(drop_mips()));
         let limit = crate::descriptor::host::next_start(start, start.saturating_add(self.layout.size))
             .map_or(u64::MAX, |at| at - start);
         [first, limit]
@@ -1245,11 +1373,9 @@ impl Staging {
         (self.memory as usize, self.read)
     }
 
-    /// The title's level and the array slice of the staging buffer's part
-    /// `i`.
+    /// The title mip and array slice represented by staging part `i`.
     fn part(&self, i: usize) -> (u32, u32) {
-        let mips = self.mips - self.first;
-        (self.first + i as u32 % mips, i as u32 / mips)
+        self.parts[i]
     }
 
     /// The host copy holds what the staging buffer was filled from
@@ -1865,6 +1991,53 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// The selected title mip, array slice and host subresource for every
+/// upload footprint. D3D12's array-major subresource numbering means the
+/// selected mip tails are discontiguous across array slices.
+fn uploaded_parts(
+    level0: u32,
+    mip_end: u32,
+    first: u32,
+    host_mips: u32,
+    array_size: u32,
+    texture3d: bool,
+) -> Vec<(u32, u32, u32)> {
+    let first = first.max(level0).min(mip_end.saturating_sub(1));
+    let arrays = if texture3d { 1 } else { array_size };
+    let mut parts = Vec::with_capacity((mip_end - first) as usize * arrays as usize);
+    for slice in 0..arrays {
+        for mip in first..mip_end {
+            let host_mip = mip - level0;
+            if host_mip < host_mips {
+                parts.push((mip, slice, slice * host_mips + host_mip));
+            }
+        }
+    }
+    parts
+}
+
+#[cfg(test)]
+mod upload_subresource_tests {
+    use super::uploaded_parts;
+
+    #[test]
+    fn array_mip_tail_skips_unuploaded_heads_per_slice() {
+        assert_eq!(uploaded_parts(0, 4, 2, 4, 3, false), vec![
+            (2, 0, 2), (3, 0, 3), (2, 1, 6), (3, 1, 7), (2, 2, 10), (3, 2, 11)
+        ]);
+    }
+
+    #[test]
+    fn host_base_mip_is_removed_from_each_subresource_index() {
+        assert_eq!(uploaded_parts(1, 5, 3, 4, 2, false), vec![(3, 0, 2), (4, 0, 3), (3, 1, 6), (4, 1, 7)]);
+    }
+
+    #[test]
+    fn volume_depth_is_not_mistaken_for_array_slices() {
+        assert_eq!(uploaded_parts(0, 4, 1, 4, 8, true), vec![(1, 0, 1), (2, 0, 2), (3, 0, 3)]);
+    }
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
@@ -1899,32 +2072,47 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let mips = level0 + u32::from(d.MipLevels);
     let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
     let read = layout.bytes_from(first) as usize;
-    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-        mips - first
-    } else {
-        (mips - first) * u32::from(d.DepthOrArraySize)
-    };
-    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
-    let mut rows = vec![0u32; count as usize];
-    let mut total = 0;
-    // SAFETY: outputs for `count` subresources.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &d,
-            first - level0,
-            count,
-            0,
-            Some(footprints.as_mut_ptr()),
-            Some(rows.as_mut_ptr()),
-            None,
-            Some(&mut total),
-        );
+    let parts = uploaded_parts(
+        level0,
+        mips,
+        first,
+        u32::from(d.MipLevels),
+        u32::from(d.DepthOrArraySize),
+        d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+    );
+    let subresources: Vec<u32> = parts.iter().map(|part| part.2).collect();
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts.len()];
+    let mut rows = vec![0u32; parts.len()];
+    // Ask D3D12 for each selected subresource. A single range beginning at
+    // `first` would include skipped mip heads on subsequent array slices.
+    let mut total = 0u64;
+    for (i, &subresource) in subresources.iter().enumerate() {
+        let base = total.next_multiple_of(512);
+        // SAFETY: each call writes one footprint and row count into its own
+        // slots; `base` is the aligned end of preceding footprints.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                subresource,
+                1,
+                base,
+                Some(&mut footprints[i]),
+                Some(&mut rows[i]),
+                None,
+                None,
+            );
+        }
+        let f = footprints[i].Footprint;
+        total = footprints[i].Offset
+            + u64::from(f.RowPitch) * u64::from(rows[i]) * u64::from(f.Depth);
     }
     let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
         None => {
             let speculative = PICKING.get().is_some() && !BAKING.get();
-            if crate::residency::upload_refused()
+            let shared = host.video_memory_groups().map(|[_, shared]| shared);
+            if !crate::budget::admit_staging_allocation(shared, total)
+                || crate::residency::upload_refused()
                 || (speculative && !crate::residency::allow_staging_growth(false))
             {
                 crate::residency::note_staging_deferred();
@@ -1952,8 +2140,9 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         data,
         footprints,
         rows,
+        parts: parts.iter().map(|part| (part.0, part.1)).collect(),
+        subresources,
         layout,
-        mips,
         first,
         level0,
         read,
@@ -2193,7 +2382,7 @@ mod allocation_costs {
                 seen.push(digest(&bytes));
             }
         }
-        let text: Vec<u8> = (0..400u32).map(|i| (i * 37 >> 2) as u8).collect();
+        let text: Vec<u8> = (0..400u32).map(|i| ((i * 37) >> 2) as u8).collect();
         for at in 0..399 {
             let mut bytes = text.clone();
             bytes.swap(at, at + 1);

@@ -61,3 +61,29 @@ as separate runs. Record median and 95th-percentile frame time, peak VRAM
 and private commit, visible texture and lighting differences, and time
 spent streaming. Repeat the first boat mission and the Series S transition
 from movies to gameplay to check the read-back and two-plane fixes.
+
+## Memory census and low-memory switches
+
+These cover tasks 1, 3–7 and 13 of the memory plan (PC 1). Most are off by
+default. The one stock-run change is the byte cap on idle single-view copies:
+it now keeps at most 64 MiB by default, where before only the 256-copy count
+was capped. Raise `VICTORY_VIEW_COPIES_MB` to keep more, or set it to 0 to
+keep none. No stock-versus-`-LowMemory` frame-time comparison is included
+here; capture one before relying on this being neutral for your title.
+
+| Setting | Effect |
+| --- | --- |
+| `VICTORY_CENSUS_FRAMES=120` (`-CensusFrames 120`) | Logs one `memory census` line every N frames, at warn level so it shows with `VICTORY_LOG=warn`. Each key is `now/peak` in MiB: private commit and working set, host copies of title memory, copies' and windows' card sides, CPU-mapped windows, the snapshot pool, texture staging, pool blocks, host textures (split into title-filled and targets/written), list scratch and its spare part, list upload buffers not yet retired, single-view copies, the raw-address directory (and what only it keeps alive), and DXGI local/non-local use and budget beside the local bytes this crate knows of. Each allocation is counted once, by its owner. Host lists' command allocators (about 9 GB in `docs/findings.md`) are driver memory with no byte counter, so the line gives `host_lists` (a count) and they show in the private commit. |
+| `VICTORY_STAGING_POOL_MB` | Most empty texture staging blocks kept, in 64 MiB blocks (default 8 blocks, 512 MiB). |
+| `VICTORY_TEXTURE_POOL_SPARE_MB` | Most empty texture heap blocks kept, in 64 MiB blocks (default up to 4 GiB while the card has room). |
+| `VICTORY_SCRATCH_SPARE_MB` | Most bytes of spare list scratch kept (default 128 MiB, 1 GiB with plenty of RAM). |
+| `VICTORY_SNAPSHOT_POOL_MB` | Bytes of snapshot buffers kept beyond the largest one (default 512). |
+| `VICTORY_VIEW_COPIES_MB` | Bytes of idle single-view copies kept (default 64). Before, only their number (256) was limited. Held copies are never evicted. |
+| `VICTORY_RAM_TRIM_MB` (`-RamTrimMB`) | Now has hysteresis: trimming starts below the threshold and stops once free memory is back above it by an eighth (512 MiB at least). While trimming, pool blocks are kept as under memory pressure and idle single-view copies are released too. |
+| `-LowMemory` | Sets `VICTORY_WINDOW_KB=512`, `VICTORY_WINDOW_TAILS=1`, staging pool 64, scratch spare 64, snapshot pool 128, texture pool spare 256 and view copies 32, unless already set. |
+
+Tasks 3 and 4 needed no code: `VICTORY_CARD_WINDOWS_MB` defaults to 0 (no
+card-side windows) and `VICTORY_CARD_BUFFERS_MB` already defaults to 512
+on cards with up to 12 GiB, both below the plan's targets, and the window
+grid and tails were already switches. Compare runs with and without
+`-LowMemory`, using the census for bytes and the overlay for frame times.

@@ -1,12 +1,23 @@
-# VIctory NVIDIA 8 GB with cool_fox
+# Adel's VIctory NVIDIA 8 GB
 
 ## Older Windows D3D12 runtimes
 
 The integration retains the NVIDIA fork's D3D12 Agility SDK 620 exports.
-For the Windows 11 21H2 setup used with the GTX 1660, place the x64
-`D3D12Core.dll` from Microsoft.Direct3D.D3D12 version 1.620.2 in the
-`D3D12` directory next to the executable. See the
-[GTX 1660 test notes](docs/HARDWARE-GTX1660.md) for the previous build results.
+`apps/victory/build.rs` downloads Microsoft.Direct3D.D3D12 **1.620.2** from
+NuGet during `cargo build` (MSVC targets) and installs
+`target\<profile>\D3D12\D3D12Core.dll` next to `victory.exe`, verified by
+SHA-256. Keep that `D3D12` folder beside any copied executable.
+
+Skip the fetch with `VICTORY_SKIP_AGILITY_FETCH=1` only when the DLL is
+already present. Manual package URL (same bytes build.rs uses):
+
+<https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.d3d12/1.620.2/microsoft.direct3d.d3d12.1.620.2.nupkg>
+
+If the log reports `0x887E0003` (`D3D12_ERROR_INVALID_REDIST`), the runtime is
+missing, outside the configured `D3D12` subfolder, or mismatched with SDK 620.
+Delete any stale app-local DLL and rebuild so `build.rs` can reinstall 1.620.2.
+
+See the [GTX 1660 test notes](docs/HARDWARE-GTX1660.md) for previous results.
 
 ## Run the pareto-residency profile
 
@@ -37,6 +48,13 @@ Set `VICTORY_CACHE_DIR` to choose a cache outside the checkout. The
 launcher defaults to `%LOCALAPPDATA%\VIctory\cache-pareto`.
 
 See the [performance comparison and test plan](docs/NVIDIA-INTEGRATION.md).
+
+Every run sends an anonymous performance report (PC specs, driver versions,
+fps timeline) to `https://rxnd.de/vi/v1` so regressions can be compared between
+builds; local copies stay in `%LOCALAPPDATA%\victory\data\telemetry`. It is on
+by default and can be disabled with `VICTORY_TELEMETRY=0`, `[telemetry]
+enabled = false` in `victory.toml`, or `victory run --no-telemetry`. See
+[docs/telemetry.md](docs/telemetry.md) for exactly what is collected.
 
 ## Upstream RX 7900 XTX notes
 

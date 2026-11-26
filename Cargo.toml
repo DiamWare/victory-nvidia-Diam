@@ -22,6 +22,7 @@ victory-shader = { path = "crates/victory-shader" }
 victory-formats = { path = "crates/victory-formats" }
 victory-pipeline = { path = "crates/victory-pipeline" }
 victory-game = { path = "crates/victory-game" }
+victory-telemetry = { path = "crates/victory-telemetry" }
 
 # External crates
 anyhow = "1.0.104"
@@ -36,6 +37,7 @@ windows-sys = "0.61.2"
 windows = "0.62.2"
 windows-core = "0.62.2"
 blake3 = "1.8.7"
+jpeg-encoder = "0.6.1"
 memchr = "2.8.3"
 # SIMD-accelerated pure-Rust zlib/deflate (Zlib license, runtime AVX2/SSE4.2 dispatch).
 zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }

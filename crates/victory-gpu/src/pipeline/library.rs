@@ -372,6 +372,7 @@ pub(crate) fn trim() {
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
     if at == 0
         || TRIMMED.load(Ordering::Relaxed)
+        || crate::residency::pressured()
         || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0"))
     {
         return;

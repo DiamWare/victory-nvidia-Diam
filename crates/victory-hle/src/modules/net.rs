@@ -13,6 +13,9 @@
 //!   `ERROR_WINHTTP_CANNOT_CONNECT`, so no request (or WebSocket) handle can
 //!   exist for one. Proxies are off and proxy auto-detection (WPAD, PAC
 //!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
+//! * Title crash reporters (Breakpad → `*.backtrace.io`, and similar) are
+//!   refused the same way. That refusal is not the crash: look for the
+//!   `VIctory: unhandled exception` / first-chance lines above it in the log.
 //! * A bind to all interfaces is narrowed to loopback, so nothing on the
 //!   network can connect in.
 #![allow(non_snake_case)]
@@ -136,6 +139,21 @@ fn loopback(ip: IpAddr) -> bool {
 fn loopback_name(name: &str) -> bool {
     let bare = name.trim_start_matches('[').trim_end_matches(']');
     bare.eq_ignore_ascii_case("localhost") || bare.parse().is_ok_and(loopback)
+}
+
+/// Hosts used only to ship a minidump after the title has already faulted.
+fn crash_report_host(name: &str) -> bool {
+    let host = name
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    host == "backtrace.io"
+        || host.ends_with(".backtrace.io")
+        || host == "crash.playstation.com"
+        || host.ends_with(".crash.playstation.com")
+        || host == "exceptions.xboxlive.com"
+        || host.ends_with(".exceptions.xboxlive.com")
 }
 
 fn shown(addr: Option<impl ToString>) -> String {
@@ -735,7 +753,14 @@ pub extern "system" fn WinHttpConnect(
     if let Some(name) = wide(server)
         && !loopback_name(&name)
     {
-        once("HTTP connection blocked", format!("{name}:{port}"));
+        if crash_report_host(&name) {
+            once(
+                "title crash report upload skipped (offline); see VIctory exception lines above",
+                format!("{name}:{port}"),
+            );
+        } else {
+            once("HTTP connection blocked", format!("{name}:{port}"));
+        }
         // SAFETY: no pointers.
         unsafe { SetLastError(ERROR_WINHTTP_CANNOT_CONNECT) };
         return std::ptr::null_mut();
@@ -902,6 +927,15 @@ mod tests {
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
+
+    #[test]
+    fn crash_report_hosts_are_recognised() {
+        assert!(crash_report_host("submit.backtrace.io"));
+        assert!(crash_report_host("SUBMIT.BACKTRACE.IO."));
+        assert!(crash_report_host("exceptions.xboxlive.com"));
+        assert!(!crash_report_host("example.com"));
+        assert!(!crash_report_host("localhost"));
+    }
 
     #[test]
     fn blocked_name_lookups_clear_the_result() {

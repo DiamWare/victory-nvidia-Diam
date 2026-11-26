@@ -20,6 +20,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcess
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use crate::host::FORK_LABEL;
 use crate::pixels::{Bitmap, short_cpu, short_gpu};
 
 /// Frames per second and ms per frame, times 100, from the present path's one-second meter.
@@ -416,7 +417,7 @@ fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
     let hardware = [
         short_cpu(&stats.cpu_name),
         short_gpu(&stats.gpu_name),
-        format!("{:.0} GB RAM  \u{b7}  soldsawn 8GB (overlay: Neptune)", stats.ram.2.round()),
+        format!("{:.0} GB RAM  \u{b7}  {FORK_LABEL} 8GB (overlay: Neptune)", stats.ram.2.round()),
     ];
     let fps_text = format!("{:.0}", stats.fps);
     let ms_text = format!("{:.1} ms", stats.ms);
@@ -528,7 +529,7 @@ fn run(adapter: Option<IDXGIAdapter3>) {
         .map(|d| String::from_utf16_lossy(&d.Description).trim_end_matches('\0').trim().to_string())
         .unwrap_or_else(|| "GPU".into());
     let names = (cpu_name(), gpu_name.clone());
-    let class = wide("Soldsawn8GBOverlay");
+    let class = wide("Adel8GBOverlay");
     // SAFETY: window class and window made and used on this thread only.
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());

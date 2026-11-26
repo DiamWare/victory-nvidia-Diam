@@ -143,6 +143,10 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Do not send this run's anonymous performance report. Equivalent
+        /// to VICTORY_TELEMETRY=0 or [telemetry] enabled = false.
+        #[arg(long)]
+        no_telemetry: bool,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -151,7 +155,7 @@ enum Command {
     /// Run a captured frame's GPU work again (diagnostics builds; see
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
-    Replay(replay::Replay),
+    Replay(Box<replay::Replay>),
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -223,13 +227,14 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            no_telemetry,
             title_args,
         } => {
             victory_hle::runtime::set_title_args(title_args);
-            run::run(&exe, unimplemented, strict, execute, console)
+            run::run(&exe, unimplemented, strict, execute, console, no_telemetry)
         }
         #[cfg(all(windows, feature = "diagnostics"))]
-        Command::Replay(options) => replay::run(options),
+        Command::Replay(options) => replay::run(*options),
         Command::Config => show_config(),
     }
 }
@@ -250,6 +255,10 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
+    println!(
+        "telemetry   : {} (opt out with VICTORY_TELEMETRY=0, [telemetry] enabled = false, or --no-telemetry)",
+        if cfg.telemetry_enabled { "on" } else { "off" }
+    );
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

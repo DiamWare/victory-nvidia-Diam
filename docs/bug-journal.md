@@ -1,5 +1,9 @@
 # GPU residency bug journal
 
+## 2026-11-26
+
+- **RTX 5060 Ti TDR / 11 s submit prep.** User report on `pareto-residency` (Series S, 32 GiB RAM, driver 32.0.16.2101): `nvlddmkm` 153 + LiveKernel 141/117, Victory `device removed` `0x887A0007` after `preparing a submission … for 11009.1 ms` with ~3 GiB physical free and ~7.8 GiB GPU textures filled. Trail showed pipeline-library page unlocks and multi-GiB idle texture sweeps on the submit path. Mitigations: enter host pressure at 4 GiB physical / 5 GiB commit (recover 6/7); `critical()` when physical < 2.5 GiB or commit cliff; under pressure/critical cap `late_most` to 64/32 (≤32 GiB default base 96); pause upload-ahead and skip library trim under pressure; under critical skip settle+full-sweep on the behind-flights submit path (refresh+pool only) and space pressured sweeps to 2.5–4 s; tighten prefetch caps (32/8 MiB).
+
 ## 2026-11-25, Pacific time
 
 - **15:38, source verification.** The default `Play-VIctory.cmd` and its `fast` selector use the same local release. Its SHA-256 matches the build from `pareto-rtx-fast` at `fabb872`. The live window showed 81.4 ms/frame for an interval with 4,463 draws/frame. This observation has no controlled scene match.
