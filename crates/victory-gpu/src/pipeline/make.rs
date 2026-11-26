@@ -33,6 +33,22 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// One of the title's skin and decoration bakes ([`bake_waits`]): its
+    /// first use waits for it whatever the frame's budget.
+    bake: bool,
+}
+
+/// Whether a draw of the title's skin and decoration bake
+/// (`crate::draw::BAKE_PIXEL_SHADERS`) waits for its pipeline without a
+/// budget. The title bakes its characters' skin into textures of its own
+/// once, while a level loads; that is also when hundreds of pipelines are
+/// being made and the frame's budget is gone. Dropped as "being made"
+/// there, the bake never ran again and every character went without skin
+/// for the run (first launch on a cold cache: no bake draw was ever bound).
+/// On by default; `VICTORY_BAKE_PIPELINE_WAIT=0`: dropped as before.
+fn bake_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_PIPELINE_WAIT").is_none_or(|v| v != "0"))
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -49,7 +65,11 @@ impl Pending {
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let bake = shaders
+            .iter()
+            .any(|s| s.stage == "pixel" && crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str()));
         Pending {
+            bake,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -123,6 +143,17 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
+        if p.bake && bake_waits() {
+            // Made here, or waited for if a worker has it already.
+            let began = Instant::now();
+            p.make();
+            tracing::info!(
+                ms = began.elapsed().as_millis() as u64,
+                shaders = ?p.shaders,
+                "a skin and decoration bake waited for its pipeline (VICTORY_BAKE_PIPELINE_WAIT=0: dropped while being made)"
+            );
+            return p.made.get()?.as_ref();
+        }
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
