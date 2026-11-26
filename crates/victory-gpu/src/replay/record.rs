@@ -1076,6 +1076,7 @@ fn list_table(t: &mut [usize; hook::SLOTS]) {
         ID3D12GraphicsCommandList_Vtbl.SetPipelineState = set_pipeline
     );
     set!(t, ID3D12GraphicsCommandList_Vtbl.ResourceBarrier = barrier);
+    set!(t, ID3D12GraphicsCommandList7_Vtbl.Barrier = enhanced_barrier);
     set!(
         t,
         ID3D12GraphicsCommandList_Vtbl.SetDescriptorHeaps = set_heaps
@@ -1208,7 +1209,6 @@ fn list_rest(t: &mut [usize; hook::SLOTS]) -> &'static [(usize, &'static str)] {
         ID3D12GraphicsCommandList4_Vtbl.DispatchRays,
         ID3D12GraphicsCommandList5_Vtbl.RSSetShadingRate,
         ID3D12GraphicsCommandList5_Vtbl.RSSetShadingRateImage,
-        ID3D12GraphicsCommandList7_Vtbl.Barrier,
         ID3D12GraphicsCommandList8_Vtbl.OMSetFrontAndBackStencilRef,
         ID3D12GraphicsCommandList9_Vtbl.RSSetDepthBias,
         ID3D12GraphicsCommandList9_Vtbl.IASetIndexBufferStripCutValue,
@@ -1950,7 +1950,13 @@ unsafe fn note(this: Ptr, cmd: impl FnOnce(&Recorder) -> Cmd) {
 unsafe extern "system" fn list_close(this: Ptr) -> HRESULT {
     // SAFETY: as above.
     unsafe {
+        let table = hook::table(this);
         let hr = own!(this, ID3D12GraphicsCommandList_Vtbl.Close)(this);
+        // The Agility SDK's runtime (1.620) sets the list's table pointer
+        // anew at a close too, as at a reset: without this, the state was
+        // looked for next to the runtime's own table and the lock written
+        // into its read-only memory.
+        hook::again(this, table, list_table);
         if let Some((_, state)) = of(this) {
             let mut inner = lock(&state.inner);
             let bytes = std::mem::take(&mut inner.bytes);
@@ -2313,6 +2319,41 @@ unsafe extern "system" fn barrier(this: Ptr, n: u32, all: *const D3D12_RESOURCE_
                 })
                 .collect();
             Cmd::Barriers { all }
+        });
+    }
+}
+
+/// An enhanced barrier (`ID3D12GraphicsCommandList7::Barrier`). The host
+/// layer sends only global ones, as its wait for everything before
+/// (`host::place::wait_for_all` where the runtime has enhanced barriers, as
+/// the Agility SDK's does): recorded as that wait is made without them, an
+/// aliasing and an unordered-access barrier of no resource. Unrecorded, the
+/// replay ran what follows such a wait too early and hung the card.
+unsafe extern "system" fn enhanced_barrier(this: Ptr, groups: u32, all: *const D3D12_BARRIER_GROUP) {
+    // SAFETY: as above.
+    unsafe {
+        own!(this, ID3D12GraphicsCommandList7_Vtbl.Barrier)(this, groups, all);
+        if groups == 0 {
+            return;
+        }
+        let global = std::slice::from_raw_parts(all, groups as usize)
+            .iter()
+            .all(|g| g.Type == D3D12_BARRIER_TYPE_GLOBAL);
+        if !global {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("frame recorder: an enhanced barrier of textures or buffers, recorded as a wait for everything")
+            });
+        }
+        note_change(this, |_| Cmd::Barriers {
+            all: vec![
+                Barrier::Alias {
+                    flags: 0,
+                    before: NONE,
+                    after: NONE,
+                },
+                Barrier::Uav { flags: 0, res: NONE },
+            ],
         });
     }
 }

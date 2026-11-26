@@ -631,15 +631,21 @@ impl Player {
             *at = Instant::now();
         };
         let mut at = Instant::now();
-        player.make_resources(options.buffers, &options.only_buffers)?;
+        player
+            .make_resources(options.buffers, &options.only_buffers)
+            .context("loading the capture: making its resources")?;
         step("resources", &mut at);
-        player.make_pipelines(options.shaders.as_deref())?;
+        player
+            .make_pipelines(options.shaders.as_deref())
+            .context("loading the capture: making its pipelines")?;
         step("pipelines", &mut at);
-        player.make_descriptors()?;
+        player.make_descriptors().context("loading the capture: making its descriptors")?;
         step("descriptors", &mut at);
-        player.load_contents()?;
+        player.load_contents().context("loading the capture: uploading the card's memory")?;
         step("contents", &mut at);
-        player.make_masters(options.buffers, options.restore)?;
+        player
+            .make_masters(options.buffers, options.restore)
+            .context("loading the capture: making the copies to restore from")?;
         step("copies to restore from", &mut at);
         let steps: Vec<String> = steps
             .iter()
@@ -747,8 +753,10 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed, and
+        // made not resident (0x800: the host's residency makes them resident
+        // as needed; a replay never does, and the card faults on them).
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -1467,6 +1475,59 @@ impl Player {
             .map(|c| (c.clone(), c.len, c.file))
             .collect();
         let missing = self.frame.contents.len() - textures.len();
+        // VICTORY_REPLAY_CHECK_CONTENTS=1: what the uploads below would copy,
+        // checked on the CPU only; =stop ends the replay there.
+        if let Some(check) = std::env::var_os("VICTORY_REPLAY_CHECK_CONTENTS") {
+            let (mut over, mut msaa, mut kinds) = (0usize, 0usize, BTreeMap::<String, (usize, u64)>::new());
+            for (i, (c, len, _)) in textures.iter().enumerate() {
+                let Some(o) = self.objects.get(&c.res) else { continue };
+                let r = &self.frame.resources[o.index];
+                let place = match &r.place {
+                    Place::Placed { .. } => "placed",
+                    Place::Committed { .. } => "committed",
+                    Place::BackBuffer {} => "back buffer",
+                };
+                let buffer = r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
+                let total = if buffer {
+                    c.first + len
+                } else {
+                    gpu::footprints(&self.device, &gpu::to_desc(&r.desc), c.first as u32, c.count).1
+                };
+                let k = kinds.entry(format!("{place} {}", if buffer { "buffer" } else { "texture" })).or_default();
+                *k = (k.0 + 1, k.1 + len);
+                let bad = if buffer { total > r.desc.width } else { total > *len };
+                if bad {
+                    over += 1;
+                }
+                if !buffer && r.desc.samples[0] > 1 {
+                    msaa += 1;
+                }
+                if i < 6 || (bad && over <= 6) {
+                    eprintln!(
+                        "content {i}: res {} {place} first {} count {} len {len} needs {total}{} desc {:?}",
+                        c.res,
+                        c.first,
+                        c.count,
+                        if bad { " TOO SHORT/LONG" } else { "" },
+                        r.desc
+                    );
+                }
+            }
+            eprintln!("contents: {} parts, {over} with a size mismatch, {msaa} multisampled; by kind {kinds:?}", textures.len());
+            let mut flags = BTreeMap::<String, usize>::new();
+            for h in &self.frame.heaps {
+                *flags.entry(format!("heap {:#x}", h.flags)).or_default() += 1;
+            }
+            for r in &self.frame.resources {
+                if let Place::Committed { flags: f, .. } = &r.place {
+                    *flags.entry(format!("committed {f:#x}")).or_default() += 1;
+                }
+            }
+            eprintln!("heap flags as recorded: {flags:?}");
+            if check == "stop" {
+                anyhow::bail!("stopped after checking the contents (VICTORY_REPLAY_CHECK_CONTENTS=stop)");
+            }
+        }
         self.worker.run(|list| {
             // SAFETY: an open list; live resources.
             unsafe {
@@ -3074,7 +3135,7 @@ impl Player {
             notes: self.notes.clone(),
             ..Default::default()
         };
-        self.set_merging(o.merge)?;
+        self.set_merging(o.merge).context("preparing: the merge of the CPU's copies")?;
         let clamps = if o.skip_clamps {
             self.clamp_results(&mut report)?
         } else {
@@ -3086,10 +3147,10 @@ impl Player {
 
     /// One run of the frame, noted in the report; its timestamps.
     fn once(&mut self, o: &Options, (built, report): &mut (Sends, Report)) -> Result<Vec<u64>> {
-        self.restore(o.restore)?;
+        self.restore(o.restore).context("a run: putting back what the run before changed")?;
         self.fresh = false;
-        let stamps = self.send(built, o)?;
-        if let Some((db, _, hash, _)) = self.picture_now()? {
+        let stamps = self.send(built, o).context("a run: sending the frame's lists")?;
+        if let Some((db, _, hash, _)) = self.picture_now().context("a run: reading the picture back")? {
             report.pictures.push((db, hash));
         }
         let ms = |a: u32, b: u32| {

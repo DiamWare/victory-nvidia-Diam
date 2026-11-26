@@ -88,7 +88,11 @@ impl Worker {
                 self.fence.SetEventOnCompletion(value, self.event)?;
                 WaitForSingleObject(self.event, INFINITE);
             }
-            self.device.GetDeviceRemovedReason()
+            let reason = self.device.GetDeviceRemovedReason();
+            if reason.is_err() {
+                removal_report(&self.device);
+            }
+            reason
         }
     }
 
@@ -96,6 +100,79 @@ impl Worker {
     pub(super) fn run(&mut self, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> Result<()> {
         let value = self.send(record)?;
         self.wait(value)
+    }
+}
+
+/// What device-removed data (`--breadcrumbs`) tells of a lost device: the
+/// faulting address and the allocations there, and for each list that did
+/// not finish, the command it stopped at. Printed once.
+pub(super) fn removal_report(device: &ID3D12Device) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Ok(dred) = device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
+        eprintln!("device lost: no device-removed data (run with --breadcrumbs)");
+        return;
+    };
+    // SAFETY: the outputs are the runtime's, valid while the device lives;
+    // nodes are walked as linked, histories have their counts.
+    unsafe {
+        match dred.GetPageFaultAllocationOutput1() {
+            Ok(f) if f.PageFaultVA != 0 => {
+                eprintln!("device lost: page fault at {:#x}", f.PageFaultVA);
+                for (what, head) in [
+                    ("in", f.pHeadExistingAllocationNode),
+                    ("in freed", f.pHeadRecentFreedAllocationNode),
+                ] {
+                    let mut node = head;
+                    let mut n = 0;
+                    while let Some(a) = node.as_ref()
+                        && n < 16
+                    {
+                        let name = if a.ObjectNameW.is_null() {
+                            "unnamed".to_owned()
+                        } else {
+                            a.ObjectNameW.to_string().unwrap_or_default()
+                        };
+                        eprintln!("  {what} {name} (type {})", a.AllocationType.0);
+                        node = a.pNext;
+                        n += 1;
+                    }
+                }
+            }
+            Ok(_) => eprintln!("device lost: no page fault noted"),
+            Err(e) => eprintln!("device lost: no page fault data ({e})"),
+        }
+        let crumbs = match dred.GetAutoBreadcrumbsOutput() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("device lost: no breadcrumbs ({e})");
+                return;
+            }
+        };
+        let mut node = crumbs.pHeadAutoBreadcrumbNode;
+        let (mut lists, mut shown) = (0, 0);
+        while let Some(p) = node.as_ref() {
+            lists += 1;
+            let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+            if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() && shown < 8 {
+                shown += 1;
+                let history = std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                let from = (done as usize).saturating_sub(3);
+                let to = (done as usize + 3).min(history.len());
+                let ops: Vec<String> = (from..to)
+                    .map(|i| format!("{}{:?}", if i == done as usize { ">" } else { "" }, history[i].0))
+                    .collect();
+                eprintln!(
+                    "  list #{lists} stopped at command {done} of {} (ops around: {})",
+                    p.BreadcrumbCount,
+                    ops.join(" ")
+                );
+            }
+            node = p.pNext;
+        }
+        eprintln!("  {lists} lists in the breadcrumbs, {shown} not finished shown (op numbers: D3D12_AUTO_BREADCRUMB_OP)");
     }
 }
 
