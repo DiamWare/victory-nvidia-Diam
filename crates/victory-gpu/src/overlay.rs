@@ -5,8 +5,8 @@
 //! front. Not for exclusive fullscreen (the swap chain is windowed, flip model, so a topmost
 //! window above it is composed as usual).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, Once};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, Once, OnceLock};
 
 use windows::Win32::Graphics::Dxgi::{
     DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3,
@@ -25,9 +25,9 @@ use crate::pixels::{Bitmap, short_cpu, short_gpu};
 /// Frames per second and ms per frame, times 100, from the present path's one-second meter.
 static FPS_X100: AtomicU64 = AtomicU64::new(0);
 static MS_X100: AtomicU64 = AtomicU64::new(0);
-/// The newest machine sample, for the window and for screenshots.
-static STATS: Mutex<Option<Stats>> = Mutex::new(None);
-static VISIBLE: AtomicBool = AtomicBool::new(true);
+/// The presenter can be rebuilt with a new window while the overlay thread lives.
+static GAME_WINDOW: AtomicUsize = AtomicUsize::new(0);
+static VISIBLE: AtomicBool = AtomicBool::new(false);
 
 const VK_F10: i32 = 0x79;
 const REFRESH: usize = 1;
@@ -35,7 +35,7 @@ const KEYS: usize = 2;
 
 /// What the panel shows.
 #[derive(Clone, Default)]
-pub(crate) struct Stats {
+struct Stats {
     fps: f64,
     ms: f64,
     cpu: f64,
@@ -59,6 +59,9 @@ static RATES: Mutex<std::collections::VecDeque<f64>> = Mutex::new(std::collectio
 
 /// Called once a second by the present path's meter.
 pub(crate) fn set_frame(fps: f64, ms: f64, draws: f64) {
+    if !enabled() {
+        return;
+    }
     FPS_X100.store((fps * 100.0) as u64, Ordering::Relaxed);
     MS_X100.store((ms * 100.0) as u64, Ordering::Relaxed);
     DRAWS_X100.store((draws * 100.0) as u64, Ordering::Relaxed);
@@ -79,34 +82,27 @@ fn more_figures() -> (f64, Option<(f64, f64, f64)>) {
     (DRAWS_X100.load(Ordering::Relaxed) as f64 / 100.0, half_minute)
 }
 
-/// The stats to draw (`None` when the overlay is off or hidden): the newest
-/// machine sample (at most half a second old) with the frame rate as it is at this moment.
-#[allow(dead_code)]
-pub(crate) fn snapshot() -> Option<Stats> {
-    if !VISIBLE.load(Ordering::Relaxed) {
-        return None;
-    }
-    let mut s = STATS.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
-    (s.fps, s.ms) = frame_figures();
-    (s.draws, s.half_minute) = more_figures();
-    Some(s)
-}
-
 fn frame_figures() -> (f64, f64) {
     (FPS_X100.load(Ordering::Relaxed) as f64 / 100.0, MS_X100.load(Ordering::Relaxed) as f64 / 100.0)
 }
 
-/// Starts the overlay thread for the game window `hwnd` (the first call only).
+fn enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_OVERLAY").is_none_or(|v| v != "0"))
+}
+
+/// Starts the overlay once and follows the current presenter's window.
 pub(crate) fn start(hwnd: windows::Win32::Foundation::HWND, adapter: Option<IDXGIAdapter3>) {
     static ONCE: Once = Once::new();
-    if std::env::var_os("VICTORY_OVERLAY").is_some_and(|v| v == "0") {
+    if !enabled() {
         return;
     }
-    let game = hwnd.0 as usize;
+    GAME_WINDOW.store(hwnd.0 as usize, Ordering::Relaxed);
     ONCE.call_once(|| {
+        VISIBLE.store(std::env::var_os("VICTORY_OVERLAY").is_some(), Ordering::Relaxed);
         let spawned = std::thread::Builder::new()
             .name("victory-overlay".into())
-            .spawn(move || run(game as HWND, adapter));
+            .spawn(move || run(adapter));
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "overlay thread not started");
         }
@@ -400,7 +396,7 @@ fn fps_colour(fps: f64) -> [u8; 3] {
 
 /// Draws the panel for a frame `frame_h` pixels tall: a premultiplied RGBA bitmap, sized to its
 /// content. The overlay window and the screenshot both call this, so they look alike.
-pub(crate) fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
+fn render(stats: &Stats, frame_h: usize) -> Option<Bitmap> {
     let s = scale(frame_h);
     let px = |v: f32| (v * s).round() as i32;
     let g = Gdi::new(s)?;
@@ -524,7 +520,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> is
     }
 }
 
-fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
+fn run(adapter: Option<IDXGIAdapter3>) {
     let gpu_name = adapter
         .as_ref()
         // SAFETY: a plain query.
@@ -575,8 +571,7 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
         SetTimer(window, REFRESH, 500, None);
         SetTimer(window, KEYS, 40, None);
         let refresh = |cpu: &mut Cpu| {
-            let stats = sample(cpu, gpu.as_ref(), adapter.as_ref(), &names);
-            *STATS.lock().unwrap_or_else(|e| e.into_inner()) = Some(stats.clone());
+            let game = GAME_WINDOW.load(Ordering::Relaxed) as HWND;
             let mut client = std::mem::zeroed::<RECT>();
             let mut origin = POINT { x: 0, y: 0 };
             let show = VISIBLE.load(Ordering::Relaxed)
@@ -586,7 +581,12 @@ fn run(game: HWND, adapter: Option<IDXGIAdapter3>) {
                 && ours_in_front()
                 && GetClientRect(game, &mut client) != 0
                 && ClientToScreen(game, &mut origin) != 0;
-            let Some(bm) = show.then(|| render(&stats, client.bottom.max(1) as usize)).flatten() else {
+            if !show {
+                ShowWindow(window, SW_HIDE);
+                return;
+            }
+            let stats = sample(cpu, gpu.as_ref(), adapter.as_ref(), &names);
+            let Some(bm) = render(&stats, client.bottom.max(1) as usize) else {
                 ShowWindow(window, SW_HIDE);
                 return;
             };

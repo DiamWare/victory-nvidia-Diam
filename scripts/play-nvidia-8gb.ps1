@@ -1,8 +1,7 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$Exe,
-    [int]$DropMips = 2,
-    [string]$Resolution = "1920x1080",
+    [Parameter(Mandatory)][string]$Exe,
+    [ValidateRange(0, 4)][int]$DropMips = 0,
+    [string]$Resolution = '1920x1080',
     [switch]$Borderless,
     [switch]$Water,
     [switch]$NoOverlay,
@@ -10,45 +9,42 @@ param(
 )
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$victory = Join-Path $repoRoot "target\release\victory.exe"
-
-if (-not (Test-Path $victory)) {
-    Write-Error "Release binary not found at $victory. Build it first with: cargo build --release --bin victory"
-    exit 1
+$runner = Join-Path $repoRoot 'target\release\victory.exe'
+if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) {
+    throw "Release executable missing at $runner. Run cargo build --release --locked -p victory."
+}
+if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+    throw "Title executable missing at $Exe."
+}
+if ($DropMips -gt 0) {
+    Write-Warning 'This build uses mip residency on demand. The DropMips setting has no effect.'
 }
 
-Remove-Item Env:VICTORY_* -ErrorAction SilentlyContinue
-
-if ($Resolution) {
-    $env:VICTORY_RESOLUTION = $Resolution
+$settings = @{
+    VICTORY_TITLE_EXE = (Resolve-Path -LiteralPath $Exe).ProviderPath
+    VICTORY_RUNNER = $runner
+    VICTORY_CONSOLE = 'series-x'
+    VICTORY_RESOLUTION = $Resolution
 }
-if ($Borderless) {
-    $env:VICTORY_BORDERLESS = "1"
-}
-if ($Water) {
-    $env:VICTORY_TEXTURE_BACK = "1"
-}
-if ($Ambient) {
-    $env:VICTORY_AMBIENT = $Ambient
-}
+if ($Borderless) { $settings.VICTORY_BORDERLESS = '1' }
+if ($Water) { $settings.VICTORY_TEXTURE_BACK = '1' }
+if ($Ambient) { $settings.VICTORY_AMBIENT = $Ambient }
 if ($NoOverlay) {
-    $env:VICTORY_OVERLAY = "0"
+    $settings.VICTORY_OVERLAY = '0'
+    $settings.VICTORY_PANEL = '0'
+} elseif (-not (Test-Path Env:VICTORY_OVERLAY)) {
+    $settings.VICTORY_OVERLAY = '1'
 }
 
-$env:VICTORY_TEXTURE_DROP_MIPS = "$DropMips"
-$env:VICTORY_COPY_PLAIN = "1"
-$env:VICTORY_INDIRECT_GATHER = "1"
-$env:VICTORY_HEAP_WORKER = "1"
-$env:VICTORY_ALIAS_ONCE = "1"
-$env:VICTORY_JOIN_PARTS = "1"
-$env:VICTORY_BACK_OWN_VIEW = "1"
-$env:VICTORY_INDIRECT_WINDOW_DRAWS = "1"
-$env:VICTORY_GUARD_HOLES_FRAME = "1"
-$env:VICTORY_COPY_CHANGED = "1"
-$env:VICTORY_CARD_WINDOWS_MB = "2048"
-$env:VICTORY_CARD_BUFFERS_MB = "1024"
-$env:VICTORY_CLAMP_WAITS = "0"
-$env:VICTORY_WIDE_MERGE = "1"
-$env:VICTORY_RELAY_OWN_QUEUE = "1"
-
-& $victory run --execute $Exe
+$saved = @{}
+try {
+    foreach ($key in $settings.Keys) {
+        $saved[$key] = [Environment]::GetEnvironmentVariable($key)
+        [Environment]::SetEnvironmentVariable($key, $settings[$key])
+    }
+    & (Join-Path $repoRoot 'Play-VIctory.cmd') pareto-residency
+} finally {
+    foreach ($key in $saved.Keys) {
+        [Environment]::SetEnvironmentVariable($key, $saved[$key])
+    }
+}

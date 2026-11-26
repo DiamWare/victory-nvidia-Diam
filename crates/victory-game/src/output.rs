@@ -22,15 +22,10 @@ const LADDER: [(u32, u32); 5] = [
 /// table, so lowering its ceiling is what makes it run below 4K (the display
 /// mode it is told about is not the lever). The table is found by its five
 /// entries; a build without it changes nothing.
-///
-/// # Safety
-/// `base` must point at `size` writable bytes of the mapped image.
-pub unsafe fn cap_ladder(base: *mut u8, size: usize, w: u32, h: u32) -> usize {
-    if base.is_null() || size < LADDER.len() * 16 {
+pub fn cap_ladder(image: &mut [u8], w: u32, h: u32) -> usize {
+    if w == 0 || h == 0 || image.len() < LADDER.len() * 16 {
         return 0;
     }
-    // SAFETY: the caller guarantees `size` writable bytes.
-    let image = unsafe { std::slice::from_raw_parts_mut(base, size) };
     let mut pattern = Vec::with_capacity(LADDER.len() * 16);
     for (lw, lh) in LADDER {
         pattern.extend_from_slice(&lw.to_le_bytes());
@@ -55,20 +50,18 @@ pub unsafe fn cap_ladder(base: *mut u8, size: usize, w: u32, h: u32) -> usize {
     changed
 }
 
-/// The `int3` of the title's pool-offset self-check, as an absolute address,
+/// The `int3` of the title's pool-offset self-check, as a file offset,
 /// or `None` if this build does not have it.
 ///
 /// The check is
 /// `mov rax,[rsp+0x78]; sub rax,[rsp+0x70]; add rax,[rip+disp]; cmp rax,
 /// 0x1fffff; jbe +1; int3`. It compares a ring-buffer offset, not a size;
 /// with a capped ladder that offset grows past 2 MiB on our builds and the
-/// check fires on a value that is unrelated to the cap. Stepping over the
-/// one `int3` (see `victory_loader::step_over_breakpoint_at`) lets the title
+/// check fires on a value that is unrelated to the cap. Replacing the
+/// one `int3` lets the title
 /// continue.
 ///
-/// # Safety
-/// `base` must point at `size` readable bytes of the mapped image.
-pub unsafe fn assert_site(base: usize, size: usize) -> Option<usize> {
+pub fn assert_site(image: &[u8]) -> Option<usize> {
     /// `mov rax,[rsp+0x78]` then `sub rax,[rsp+0x70]`.
     const PREFIX: [u8; 10] = [0x48, 0x8b, 0x44, 0x24, 0x78, 0x48, 0x2b, 0x44, 0x24, 0x70];
     /// `add rax,[rip+disp32]`: four displacement bytes follow.
@@ -80,20 +73,15 @@ pub unsafe fn assert_site(base: usize, size: usize) -> Option<usize> {
     /// The instruction sequence is 26 bytes, `int3` the last of them.
     const LEN: usize = 26;
 
-    if base == 0 || size < LEN {
-        return None;
-    }
-    // SAFETY: the caller guarantees `size` readable bytes.
-    let image = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
     let mut at = 0;
     while at + LEN <= image.len() {
         if image[at..at + 10] == PREFIX
             && image[at + 10..at + 13] == ADD
             && image[at + 17..at + 23] == CMP
             && image[at + 23] == JBE
-            && image[at + 25] == 0xcc
+            && image[at + 24..at + 26] == [1, 0xcc]
         {
-            return Some(base + at + 25);
+            return Some(at + 25);
         }
         at += 1;
     }
@@ -120,8 +108,7 @@ mod tests {
     #[test]
     fn caps_the_entries_above_the_target() {
         let mut image = image_with_ladder(64);
-        // SAFETY: the buffer is that long.
-        let changed = unsafe { cap_ladder(image.as_mut_ptr(), image.len(), 1920, 1080) };
+        let changed = cap_ladder(&mut image, 1920, 1080);
         assert_eq!(changed, 2, "1440p and 2160p");
         let entry = |i: usize| {
             let at = 64 + 16 * i;
@@ -141,8 +128,7 @@ mod tests {
     fn a_build_without_the_ladder_is_unchanged() {
         let mut image = vec![0x90u8; 256];
         let before = image.clone();
-        // SAFETY: the buffer is that long.
-        let changed = unsafe { cap_ladder(image.as_mut_ptr(), image.len(), 1920, 1080) };
+        let changed = cap_ladder(&mut image, 1920, 1080);
         assert_eq!(changed, 0);
         assert_eq!(image, before);
     }
@@ -155,9 +141,8 @@ mod tests {
             0xc0, 0x16, 0x05, 0x48, 0x3d, 0xff, 0xff, 0x1f, 0x00, 0x76, 0x01, 0xcc,
         ];
         image[40..40 + code.len()].copy_from_slice(&code);
-        // SAFETY: the buffer is that long.
-        let site = unsafe { assert_site(image.as_ptr() as usize, image.len()) };
-        assert_eq!(site.map(|at| at - image.as_ptr() as usize), Some(65));
+        let site = assert_site(&image);
+        assert_eq!(site, Some(65));
     }
 
     #[test]
@@ -171,7 +156,6 @@ mod tests {
         image[57..63].copy_from_slice(&[0x48, 0x3d, 0xff, 0xff, 0xff, 0x00]);
         image[63] = 0x76;
         image[65] = 0xcc;
-        // SAFETY: the buffer is that long.
-        assert_eq!(unsafe { assert_site(image.as_ptr() as usize, image.len()) }, None);
+        assert_eq!(assert_site(&image), None);
     }
 }
