@@ -5,7 +5,8 @@ param(
     [string]$Resolution = "1920x1080",
     [switch]$Borderless,
     [switch]$Water,
-    [switch]$NoOverlay
+    [switch]$NoOverlay,
+    [string]$Ambient = ""
 )
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -26,6 +27,9 @@ if ($Borderless) {
 }
 if ($Water) {
     $env:VICTORY_TEXTURE_BACK = "1"
+}
+if ($Ambient) {
+    $env:VICTORY_AMBIENT = $Ambient
 }
 if ($NoOverlay) {
     $env:VICTORY_OVERLAY = "0"
