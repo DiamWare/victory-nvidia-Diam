@@ -11,7 +11,13 @@ param(
     # Free physical memory in MiB under which idle memory is trimmed (0: off).
     [ValidateRange(0, 262144)][int]$RamTrimMB = 0,
     # Log a memory census every N frames (0: off).
-    [ValidateRange(0, 100000)][int]$CensusFrames = 0
+    [ValidateRange(0, 100000)][int]$CensusFrames = 0,
+    # Keeps the card's clocks up with a compute loop (Play-VIctory.cmd turns it
+    # on). Measured on an RTX 4090 Laptop: no fps change, only heat; off here.
+    [switch]$CardAwake,
+    # Sends performance reports (fps, PC specs, game-window screenshots, logs)
+    # to the upstream author's server (crates/victory-telemetry). Off here.
+    [switch]$Telemetry
 )
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -48,6 +54,12 @@ if ($LowMemory) {
 }
 if ($RamTrimMB -gt 0) { $settings.VICTORY_RAM_TRIM_MB = "$RamTrimMB" }
 if ($CensusFrames -gt 0) { $settings.VICTORY_CENSUS_FRAMES = "$CensusFrames" }
+if (-not (Test-Path Env:VICTORY_CARD_AWAKE)) {
+    $settings.VICTORY_CARD_AWAKE = if ($CardAwake) { '1' } else { '0' }
+}
+if (-not (Test-Path Env:VICTORY_TELEMETRY)) {
+    $settings.VICTORY_TELEMETRY = if ($Telemetry) { '1' } else { '0' }
+}
 if ($NoOverlay) {
     $settings.VICTORY_OVERLAY = '0'
     $settings.VICTORY_PANEL = '0'
